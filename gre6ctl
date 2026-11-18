@@ -22,7 +22,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 BASE = Path(os.environ.get("GRE6CTL_BASE", "/etc/gre6ctl"))
 TUNNELS = BASE / "tunnels"
 LOCK = BASE / ".lock"
@@ -317,6 +317,89 @@ def ensure_local_ipv6(addr):
     fail(f"Local IPv6 {addr} is not configured on this server (or is tentative)")
 
 
+def local_ipv6_candidates():
+    """Read usable IPv6 addresses assigned to this host, prefer default-route links.
+
+    This does not inspect or discover the remote host. It does not contact third
+    party IP echo services, and never silently picks a peer endpoint.
+    """
+    require_ip()
+    links = jrun(["ip", "-j", "-6", "addr", "show"])
+    preferred = set()
+    routes = run(["ip", "-j", "-6", "route", "show", "default"], check=False)
+    if routes.returncode == 0:
+        try:
+            preferred = {r.get("dev") for r in json.loads(routes.stdout) if r.get("dev")}
+        except (ValueError, TypeError):
+            preferred = set()
+    results = []
+    seen = set()
+    for link in links:
+        iface = link.get("ifname", "")
+        for info in link.get("addr_info", []):
+            if info.get("family") != "inet6":
+                continue
+            raw = info.get("local", "")
+            try:
+                addr = ipa.IPv6Address(raw)
+                v6(str(addr))
+            except (ValueError, Failure):
+                continue
+            flags = {str(flag).lower() for flag in info.get("flags", [])}
+            if any(info.get(k) for k in ("tentative", "dadfailed", "deprecated")) or flags.intersection({"tentative", "dadfailed", "deprecated", "temporary"}):
+                continue
+            # is_global can be conservative for some globally-routed ranges;
+            # validate with the same endpoint validation used at tunnel creation.
+            if str(addr) in seen:
+                continue
+            seen.add(str(addr))
+            results.append((str(addr), iface, iface in preferred))
+    return sorted(results, key=lambda item: (not item[2], item[1], item[0]))
+
+
+def ui_pick_local_ipv6(default=None):
+    """Suggest assigned local IPv6 and require explicit approval."""
+    candidates = local_ipv6_candidates()
+    print(ui_color("\n  LOCAL IPv6 DISCOVERY", "cyan"))
+    if not candidates:
+        print(ui_color("  No usable IPv6 detected. You can enter an assigned IPv6 manually.", "yellow"))
+    else:
+        for i, (addr, iface, preferred) in enumerate(candidates, 1):
+            hint = "  [default-route interface]" if preferred else ""
+            print(f"  [{i}] {addr}  ({iface}){hint}")
+    if default and all(c[0] != default for c in candidates):
+        print(ui_color(f"  Current configured IPv6: {default}", "yellow"))
+    if candidates:
+        selected = default if default and any(c[0] == default for c in candidates) else candidates[0][0]
+        if ui_confirm(f"Use local IPv6 {selected}?", True):
+            return selected
+        selection = str(prompt("Choose number, [m] manual IPv6, or [c] cancel", "m")).strip().lower()
+        if selection == "c":
+            fail("IPv6 selection cancelled")
+        if selection.isdecimal() and 1 <= int(selection) <= len(candidates):
+            chosen = candidates[int(selection)-1][0]
+            if ui_confirm(f"Confirm local IPv6 {chosen}?", True):
+                return chosen
+            fail("IPv6 selection cancelled")
+        if selection != "m":
+            fail("Invalid IPv6 selection")
+    supplied = v6(prompt("Enter THIS server IPv6 manually"))
+    if not any(addr == supplied for addr, _, _ in candidates):
+        # The kernel's local-address check remains authoritative when starting.
+        print(ui_color("  Warning: this IPv6 was not detected on a local interface.", "yellow"))
+    if not ui_confirm(f"Confirm local IPv6 {supplied}?", False):
+        fail("IPv6 selection cancelled")
+    return supplied
+
+
+def ui_pick_remote_ipv6(default=None):
+    print(ui_color("  Remote IPv6 cannot be scanned from this server.", "muted"))
+    value = v6(prompt("REMOTE server IPv6", default))
+    if not ui_confirm(f"Confirm remote IPv6 {value}?", True):
+        fail("Remote IPv6 selection cancelled")
+    return value
+
+
 def preflight(cfg):
     require_ip()
     ensure_local_ipv6(cfg["local6"])
@@ -495,7 +578,9 @@ def create_cmd(args):
         enable_cmd(arg_name(args.name))
     elif args.up:
         up_cmd(arg_name(args.name))
-    print("On hub, run 'gre6ctl export-peer NAME' and import token on peer server.")
+    print("\nPeer configuration token (paste into 'gre6ctl import-peer TOKEN --enable' on remote):")
+    print(peer_token(cfg))
+    print("Token contains endpoints and private IPs; it is not encrypted.")
 
 
 def up_cmd(args):
@@ -626,15 +711,29 @@ def doctor_all_cmd(_args):
         fail("Diagnose failure: " + ", ".join(errors))
 
 
-def export_peer_cmd(args):
-    cfg = load(args.name)
+def peer_token(cfg):
     peer = dict(cfg)
     peer["local6"], peer["peer6"] = cfg["peer6"], cfg["local6"]
     peer["local4"], peer["peer4"] = cfg["peer4"], cfg["local4"]
     payload = {"format": "gre6ctl-peer", "version": 1, "config": peer}
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    token = TOKEN_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    print(token)
+    return TOKEN_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def ui_show_peer_setup(cfg):
+    """Display the import token immediately, with the peer side already reversed."""
+    token = peer_token(cfg)
+    ui_line("REMOTE SERVER CONFIGURATION")
+    print(ui_color("  Copy this token to the OTHER server (do not run on this server):", "green"))
+    print("\n" + token + "\n")
+    print(ui_color("  On the remote server, open 'sudo gre6ctl menu', choose IRAN and Import Peer.", "muted"))
+    print(ui_color("  Or execute: sudo gre6ctl import-peer '<TOKEN>' --enable", "muted"))
+    print(ui_color("  Token is base64-encoded configuration, NOT encrypted. Share privately.", "yellow"))
+
+
+def export_peer_cmd(args):
+    cfg = load(args.name)
+    print(peer_token(cfg))
     print("\nThis token contains configuration, not credentials. Transfer through a trusted channel.", file=sys.stderr)
 
 
@@ -960,28 +1059,43 @@ def ui_dashboard():
 
 
 def ui_create():
-    ui_line('CREATE NEW TUNNEL')
-    print(ui_color("  Use the FOREIGN / hub server as the IP allocator. The next free /30 is suggested.", "muted"))
+    ui_line('CREATE NEW TUNNEL / FOREIGN HUB')
+    print(ui_color("  The FOREIGN server is the central IPv4 allocator for all Iran peers.", "muted"))
     name = prompt("Tunnel name (example: iran1)")
-    local6 = prompt("THIS server public IPv6")
-    peer6 = prompt("REMOTE server public IPv6")
+    local6 = ui_pick_local_ipv6()
+    peer6 = ui_pick_remote_ipv6()
     mtu = int(prompt("GRE MTU", "1400"))
     create_cmd(argparse.Namespace(name=name, local6=local6, peer6=peer6,
                 subnet=None, local_ip=None, peer_ip=None, mtu=mtu,
                 hoplimit=64, enable=False, up=False, accept_auto=False))
-    if ui_confirm("Start tunnel and enable at boot?", False):
-        enable_cmd(arg_name(name))
-    print(ui_color("  Next: use Export Peer Token and import it on the remote server.", "green"))
+    # Print import instructions regardless of whether the user starts this end now.
+    if ui_confirm("Start tunnel and enable at boot?", True):
+        try:
+            enable_cmd(arg_name(name))
+        except Failure as exc:
+            print(ui_color(f"  Tunnel was saved, but startup failed: {exc}", "yellow"))
+            print(ui_color("  Remote configuration can still be transferred; fix startup and retry.", "muted"))
+    ui_show_peer_setup(load(name))
 
 
 def ui_import():
-    ui_line('IMPORT PEER TOKEN')
-    token = prompt("Paste peer token")
+    ui_line('IMPORT PEER TOKEN / IRAN SPOKE')
+    print(ui_color("  Paste the token created on the FOREIGN server.", "muted"))
+    token = prompt("Peer configuration token")
     cfg = decode_peer(token)
+    print(f"  Token local IPv6:  {cfg['local6']}")
+    print(f"  Token remote IPv6: {cfg['peer6']}")
+    print(f"  Private IPv4:      {cfg['local4']}  <->  {cfg['peer4']}")
+    chosen = ui_pick_local_ipv6(default=cfg['local6'])
+    if chosen != cfg['local6']:
+        print(ui_color("  The token's IPv6 does not match this server. Update the FOREIGN hub peer IPv6", "yellow"))
+        print(ui_color("  to this address and export a NEW peer token before importing here.", "yellow"))
+        fail("Peer token IPv6 mismatch; no changes applied")
     name = prompt("Local interface name", cfg['name'])
     update = ui_confirm("Update existing tunnel (if any)?", False)
     up = ui_confirm("Start and enable at boot?", True)
     import_peer_cmd(argparse.Namespace(token=token, name=name, update=update, up=False, enable=up))
+    print(ui_color("  Peer imported. Run Diagnose to verify end-to-end connectivity.", "green"))
 
 
 def ui_edit_ip():
@@ -1011,8 +1125,8 @@ def ui_edit_ip():
 def ui_edit_network():
     name=ui_choose_tunnel()
     cfg=load(name)
-    newlocal=prompt("THIS server IPv6", cfg['local6'])
-    newpeer=prompt("REMOTE server IPv6", cfg['peer6'])
+    newlocal=ui_pick_local_ipv6(default=cfg['local6'])
+    newpeer=ui_pick_remote_ipv6(default=cfg['peer6'])
     mtu=int(prompt("MTU", str(cfg['mtu'])))
     hop=int(prompt("Hop limit", str(cfg['hoplimit'])))
     if not ui_confirm("Apply endpoint/MTU changes?", False):
@@ -1020,6 +1134,7 @@ def ui_edit_network():
         return
     edit_cmd(argparse.Namespace(name=name, subnet=None, local_ip=None, peer_ip=None,
                   local6=newlocal, peer6=newpeer, mtu=mtu, hoplimit=hop))
+    print(ui_color("  If endpoint details changed, export a NEW token and update the other server.", "yellow"))
 
 
 def ui_action(action):
@@ -1050,19 +1165,36 @@ def ui_action(action):
     else: fail("Unknown menu option")
 
 
+def ui_select_role():
+    ui_clear()
+    ui_header("WELCOME  /  Select the server you are configuring")
+    print("\n  [1] FOREIGN SERVER  —  central hub; create tunnels, allocate private IPv4")
+    print("  [2] IRAN SERVER     —  remote peer; import configuration from foreign hub")
+    print("  [0] Exit\n")
+    while True:
+        answer = str(prompt("Which server are you setting up? (1/2/0)")).strip()
+        if answer == "1": return "foreign"
+        if answer == "2": return "iran"
+        if answer == "0": return None
+        print(ui_color("  Select 1, 2 or 0.", "yellow"))
+
+
 def menu_cmd(_args):
     root()
+    role = ui_select_role()
+    if role is None:
+        return
     choices = {'1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16'}
     while True:
         ui_clear()
-        ui_header('CONTROL CENTER  /  Multi-peer GRE6 tunnel management')
+        ui_header(('FOREIGN HUB' if role == 'foreign' else 'IRAN PEER') + '  /  GRE6 CONTROL CENTER')
         try:
             ui_dashboard()
         except Failure as exc:
             print(ui_color(f"  Dashboard unavailable: {exc}", "yellow"))
         ui_section('TUNNELS', [
-            ('1', 'Create tunnel', 'guided setup + IP approval'),
-            ('2', 'Import peer token', 'connect remote server'),
+            ('1', 'Create tunnel', 'foreign hub: auto IPv6 & private IP proposal'),
+            ('2', 'Import peer token', 'Iran peer: import foreign hub config'),
             ('3', 'Export peer token', 'copy peer configuration'),
             ('4', 'List all tunnels', 'overview'),
             ('5', 'Tunnel details', 'configuration & link state'),
@@ -1090,7 +1222,13 @@ def menu_cmd(_args):
             if choice in ('r','refresh',''): continue
             if choice in choices:
                 print()
-                ui_action(choice)
+                if role == 'iran' and choice == '1':
+                    print(ui_color('  Create tunnels on the FOREIGN hub, then import its token here.', 'yellow'))
+                elif role == 'foreign' and choice == '2':
+                    if ui_confirm('Importing is usually for the IRAN peer. Continue?', False):
+                        ui_action(choice)
+                else:
+                    ui_action(choice)
             else:
                 print(ui_color('  Unknown option. Enter a menu number.', 'yellow'))
         except (Failure, ValueError, EOFError) as exc:
