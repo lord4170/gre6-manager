@@ -16,12 +16,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import textwrap
 import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 BASE = Path(os.environ.get("GRE6CTL_BASE", "/etc/gre6ctl"))
 TUNNELS = BASE / "tunnels"
 LOCK = BASE / ".lock"
@@ -849,101 +850,254 @@ def prompt(label, default=None):
     return value if value else default
 
 
+# Zero-dependency terminal UI. UI helpers never alter existing networking logic.
+_UI_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None and os.environ.get("TERM", "") != "dumb"
+_UI = {"reset": "\x1b[0m", "bold": "\x1b[1m", "muted": "\x1b[90m", "cyan": "\x1b[96m", "blue": "\x1b[94m", "green": "\x1b[92m", "yellow": "\x1b[93m", "red": "\x1b[91m"}
+
+
+def ui_color(text, name):
+    return (_UI[name] + str(text) + _UI["reset"]) if _UI_COLOR else str(text)
+
+
+def ui_width():
+    return max(52, min(shutil.get_terminal_size((88, 24)).columns - 2, 100))
+
+
+def ui_line(label="", mark="─"):
+    width = ui_width()
+    if label:
+        s = f" {label} "
+        print(ui_color("─" * 2 + s + "─" * max(0, width - len(s) - 2), "muted"))
+    else:
+        print(ui_color(mark * width, "muted"))
+
+
+def ui_clear():
+    if sys.stdout.isatty() and os.environ.get("GRE6_NO_CLEAR") != "1":
+        print("\x1b[2J\x1b[H", end="", flush=True)
+
+
+def ui_header(subtitle):
+    print(ui_color("  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓", "cyan"))
+    print(ui_color("  ┃         GRE6  /  TUNNEL MANAGER            ┃", "cyan"))
+    print(ui_color("  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛", "cyan"))
+    print(f"  {ui_color('GRE OVER IPv6', 'bold')}  {ui_color('•', 'muted')}  {ui_color('v' + VERSION, 'green')}  {ui_color('•', 'muted')}  No NAT / No default-route changes")
+    ui_line()
+    print("  " + ui_color(subtitle, "bold"))
+
+
+def ui_section(title, items):
+    ui_line(title)
+    for code, title, description in items:
+        if ui_width() < 76:
+            print(f"  {ui_color(f'[{code:>2}]', 'cyan')} {title}")
+            print(f"       {ui_color(description, 'muted')}")
+        else:
+            print(f"  {ui_color(f'[{code:>2}]', 'cyan')} {title:<25} {ui_color(description, 'muted')}")
+    print()
+
+
+def ui_pause():
+    if sys.stdin.isatty():
+        try:
+            input(ui_color("\n  Press ENTER to return to menu...", "muted"))
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def ui_confirm(label, default=False):
+    suffix = "Y/n" if default else "y/N"
+    response = prompt(f"{label} ({suffix})", "y" if default else "n")
+    return str(response).lower() in ("y", "yes")
+
+
+def ui_choose_tunnel():
+    rows = all_configs()
+    if not rows:
+        fail("No tunnels configured. Create or import a tunnel first")
+    print(ui_color("\n  SELECT TUNNEL", "cyan"))
+    for i, cfg in enumerate(rows, 1):
+        print(f"  {ui_color(f'{i:>2}.', 'cyan')} {cfg['name']:<16} {cfg['local4']:<16} -> {cfg['peer4']}")
+    selected = str(prompt("Tunnel number or name"))
+    if selected.isdecimal() and 1 <= int(selected) <= len(rows):
+        return rows[int(selected) - 1]["name"]
+    if any(c["name"] == selected for c in rows):
+        return selected
+    fail("Unknown tunnel selection")
+
+
+def ui_dashboard():
+    configs = all_configs()
+    states = []
+    for cfg in configs:
+        try:
+            link = get_link(cfg['name'])
+            state = 'UP' if owned_link(link, cfg['name']) and 'UP' in link.get('flags', []) else 'DOWN'
+        except Failure:
+            state = 'ERROR'
+        states.append((cfg, state))
+    up = sum(state == 'UP' for _, state in states)
+    boot = sum(enabled(c['name']) for c, _ in states)
+    print(f"\n  {ui_color('TUNNELS', 'muted')} {ui_color(len(states), 'bold')}   "
+          f"{ui_color('ONLINE', 'muted')} {ui_color(up, 'green')}   "
+          f"{ui_color('OFFLINE', 'muted')} {ui_color(len(states)-up, 'yellow')}   "
+          f"{ui_color('AUTOSTART', 'muted')} {ui_color(boot, 'cyan')}")
+    ui_line('LIVE TUNNELS')
+    if not states:
+        print(ui_color("  No tunnels yet. Choose [1] to create your first tunnel.", "yellow"))
+    else:
+        if ui_width() >= 76:
+            print(ui_color(f"  {'TUNNEL':<16} {'LOCAL IPv4':<16} {'PEER IPv4':<16} {'STATE':<9} BOOT", "muted"))
+        for cfg, state in states[:12]:
+            state_color = 'green' if state == 'UP' else 'red' if state == 'ERROR' else 'yellow'
+            boot_s = 'ON' if enabled(cfg['name']) else '--'
+            if ui_width() < 76:
+                print(f"  {cfg['name']}  {ui_color(state, state_color)}  boot:{boot_s}  {cfg['local4']} -> {cfg['peer4']}")
+            else:
+                print(f"  {cfg['name']:<16} {cfg['local4']:<16} {cfg['peer4']:<16} {ui_color(f'{state:<9}', state_color)} {boot_s}")
+        if len(states)>12: print(ui_color(f"  ... +{len(states)-12} more (select [4] to see all)", "muted"))
+    print()
+
+
+def ui_create():
+    ui_line('CREATE NEW TUNNEL')
+    print(ui_color("  Use the FOREIGN / hub server as the IP allocator. The next free /30 is suggested.", "muted"))
+    name = prompt("Tunnel name (example: iran1)")
+    local6 = prompt("THIS server public IPv6")
+    peer6 = prompt("REMOTE server public IPv6")
+    mtu = int(prompt("GRE MTU", "1400"))
+    create_cmd(argparse.Namespace(name=name, local6=local6, peer6=peer6,
+                subnet=None, local_ip=None, peer_ip=None, mtu=mtu,
+                hoplimit=64, enable=False, up=False, accept_auto=False))
+    if ui_confirm("Start tunnel and enable at boot?", False):
+        enable_cmd(arg_name(name))
+    print(ui_color("  Next: use Export Peer Token and import it on the remote server.", "green"))
+
+
+def ui_import():
+    ui_line('IMPORT PEER TOKEN')
+    token = prompt("Paste peer token")
+    cfg = decode_peer(token)
+    name = prompt("Local interface name", cfg['name'])
+    update = ui_confirm("Update existing tunnel (if any)?", False)
+    up = ui_confirm("Start and enable at boot?", True)
+    import_peer_cmd(argparse.Namespace(token=token, name=name, update=update, up=False, enable=up))
+
+
+def ui_edit_ip():
+    name = ui_choose_tunnel()
+    old = load(name)
+    print(f"  Current: {old['local4']} <-> {old['peer4']}   [{old['subnet']}]")
+    print("  [1] Choose a new /30 subnet (auto .1 and .2 host pair)")
+    print("  [2] Enter both private IPv4 addresses manually")
+    mode = prompt("Option", "1")
+    sub = local = peer = None
+    if mode == "1":
+        sub = prompt("New /30 subnet")
+    elif mode == "2":
+        local = prompt("New THIS-server private IPv4")
+        peer = prompt("New REMOTE-server private IPv4")
+        sub = str(ipa.IPv4Network(f"{local}/30", strict=False))
+    else:
+        fail("Invalid option")
+    print(ui_color("  IMPORTANT: remote peer must be updated with a new token afterwards.", "yellow"))
+    if not ui_confirm("Apply change?", False):
+        print("Cancelled")
+        return
+    edit_cmd(argparse.Namespace(name=name, subnet=sub, local_ip=local, peer_ip=peer,
+                  local6=None, peer6=None, mtu=None, hoplimit=None))
+
+
+def ui_edit_network():
+    name=ui_choose_tunnel()
+    cfg=load(name)
+    newlocal=prompt("THIS server IPv6", cfg['local6'])
+    newpeer=prompt("REMOTE server IPv6", cfg['peer6'])
+    mtu=int(prompt("MTU", str(cfg['mtu'])))
+    hop=int(prompt("Hop limit", str(cfg['hoplimit'])))
+    if not ui_confirm("Apply endpoint/MTU changes?", False):
+        print("Cancelled")
+        return
+    edit_cmd(argparse.Namespace(name=name, subnet=None, local_ip=None, peer_ip=None,
+                  local6=newlocal, peer6=newpeer, mtu=mtu, hoplimit=hop))
+
+
+def ui_action(action):
+    if action == '1': ui_create()
+    elif action == '2': ui_import()
+    elif action == '3': export_peer_cmd(arg_name(ui_choose_tunnel()))
+    elif action == '4': list_cmd(None)
+    elif action == '5': status_cmd(arg_name(ui_choose_tunnel()))
+    elif action == '6':
+        name=ui_choose_tunnel()
+        if ui_confirm(f"Enable {name} at boot?", True): enable_cmd(arg_name(name))
+        else: restart_cmd(arg_name(name))
+    elif action == '7':
+        name=ui_choose_tunnel()
+        if ui_confirm(f"Stop and disable {name}?", False): disable_cmd(arg_name(name))
+    elif action == '8': ui_edit_ip()
+    elif action == '9': ui_edit_network()
+    elif action == '10': ipam_cmd(None)
+    elif action == '11': check_subnet_cmd(argparse.Namespace(subnet=prompt("Private IPv4 /30 subnet"), exclude=None))
+    elif action == '12': doctor_cmd(arg_name(ui_choose_tunnel()))
+    elif action == '13': doctor_all_cmd(None)
+    elif action == '14': backup_cmd(argparse.Namespace(path=prompt("Backup file", "/root/gre6ctl-backup.json"), overwrite=False))
+    elif action == '15': restore_cmd(argparse.Namespace(path=prompt("Backup file", "/root/gre6ctl-backup.json")))
+    elif action == '16':
+        name=ui_choose_tunnel()
+        print(ui_color("  DANGER: this removes the tunnel configuration and stops the managed interface.", "red"))
+        delete_cmd(argparse.Namespace(name=name, yes=False))
+    else: fail("Unknown menu option")
+
+
 def menu_cmd(_args):
     root()
+    choices = {'1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16'}
     while True:
-        print("\n╔══════════════════════════════════════════════════╗")
-        print("║ gre6ctl 2.1 — GRE6 multi-peer tunnel manager     ║")
-        print("╚══════════════════════════════════════════════════╝")
-        print("1. List tunnels        2. Create tunnel")
-        print("3. Export peer token   4. Import/update peer")
-        print("5. Edit private IPv4   6. Change MTU / endpoints")
-        print("7. Start/restart       8. Stop / disable")
-        print("9. Diagnose            10. Show details")
-        print("11. Delete             12. Backup configs")
-        print("13. IPAM overview      14. Check subnet")
-        print("15. Restore backup     16. Diagnose all")
-        print("0. Exit")
+        ui_clear()
+        ui_header('CONTROL CENTER  /  Multi-peer GRE6 tunnel management')
         try:
-            choice = input("Select: ").strip()
-            if choice == "0":
-                return
-            if choice == "1":
-                list_cmd(None)
-            elif choice == "2":
-                name = prompt("Tunnel name (e.g. iran1)")
-                local6 = prompt("THIS server public IPv6")
-                peer6 = prompt("PEER server public IPv6")
-                mtu = int(prompt("MTU", "1400"))
-                # create_cmd shows suggested IPs and asks to approve or enter
-                # a custom pair/subnet; this prompt is shared with the CLI.
-                create_cmd(argparse.Namespace(name=name, local6=local6, peer6=peer6,
-                           subnet=None, local_ip=None, peer_ip=None, mtu=mtu,
-                           hoplimit=64, enable=False, up=False, accept_auto=False))
-                if prompt("Activate and enable after reboot? (y/N)", "n").lower() == "y":
-                    enable_cmd(arg_name(name))
-            elif choice == "3":
-                export_peer_cmd(arg_name(prompt("Tunnel name")))
-            elif choice == "4":
-                token = prompt("Paste peer token")
-                cfg = decode_peer(token)
-                name = prompt("Local interface name", cfg["name"])
-                update = prompt("Update existing tunnel? (y/N)", "n").lower() == "y"
-                up = prompt("Enable and start automatically? (y/N)", "n").lower() == "y"
-                import_peer_cmd(argparse.Namespace(token=token, name=name, update=update, up=False, enable=up))
-            elif choice == "5":
-                name = prompt("Tunnel name")
-                old = load(name)
-                print(f"Current: {old['local4']} <-> {old['peer4']} ({old['subnet']})")
-                mode = prompt("Change (subnet / pair)", "subnet")
-                sub = local = peer = None
-                if mode == "subnet":
-                    sub = prompt("New /30 subnet")
-                elif mode == "pair":
-                    local = prompt("New local private IPv4")
-                    peer = prompt("New peer private IPv4")
-                    sub = str(ipa.IPv4Network(f"{local}/30", strict=False))
-                else:
-                    fail("Choose subnet or pair")
-                edit_cmd(argparse.Namespace(name=name, subnet=sub, local_ip=local, peer_ip=peer,
-                         local6=None, peer6=None, mtu=None, hoplimit=None))
-            elif choice == "6":
-                name = prompt("Tunnel name")
-                cfg = load(name)
-                edit_cmd(argparse.Namespace(name=name, subnet=None, local_ip=None, peer_ip=None,
-                    local6=prompt("This server IPv6", cfg["local6"]),
-                    peer6=prompt("Peer server IPv6", cfg["peer6"]),
-                    mtu=int(prompt("MTU", str(cfg["mtu"]))),
-                    hoplimit=int(prompt("Hop limit", str(cfg["hoplimit"])))))
-            elif choice == "7":
-                name = prompt("Tunnel name")
-                if prompt("Enable on reboot? (Y/n)", "y").lower() == "y":
-                    enable_cmd(arg_name(name))
-                else:
-                    restart_cmd(arg_name(name))
-            elif choice == "8":
-                disable_cmd(arg_name(prompt("Tunnel name")))
-            elif choice == "9":
-                doctor_cmd(arg_name(prompt("Tunnel name")))
-            elif choice == "10":
-                status_cmd(arg_name(prompt("Tunnel name")))
-            elif choice == "11":
-                delete_cmd(argparse.Namespace(name=prompt("Tunnel name"), yes=False))
-            elif choice == "12":
-                backup_cmd(argparse.Namespace(path=prompt("Backup file", "/root/gre6ctl-backup.json"), overwrite=False))
-            elif choice == "13":
-                ipam_cmd(None)
-            elif choice == "14":
-                check_subnet_cmd(argparse.Namespace(subnet=prompt("Private IPv4 /30 subnet"), exclude=None))
-            elif choice == "15":
-                restore_cmd(argparse.Namespace(path=prompt("Backup file", "/root/gre6ctl-backup.json")))
-            elif choice == "16":
-                doctor_all_cmd(None)
+            ui_dashboard()
+        except Failure as exc:
+            print(ui_color(f"  Dashboard unavailable: {exc}", "yellow"))
+        ui_section('TUNNELS', [
+            ('1', 'Create tunnel', 'guided setup + IP approval'),
+            ('2', 'Import peer token', 'connect remote server'),
+            ('3', 'Export peer token', 'copy peer configuration'),
+            ('4', 'List all tunnels', 'overview'),
+            ('5', 'Tunnel details', 'configuration & link state'),
+            ('6', 'Start / restart', 'optionally enable on boot'),
+            ('7', 'Stop / disable', 'requires confirmation'),
+        ])
+        ui_section('NETWORK & IP MANAGEMENT', [
+            ('8', 'Change private IPv4', 'custom /30 or IP pair'),
+            ('9', 'Edit IPv6 / MTU', 'update endpoints & parameters'),
+            ('10', 'IP address inventory', 'reserved networks & next pair'),
+            ('11', 'Check custom subnet', 'collision detection'),
+        ])
+        ui_section('MAINTENANCE', [
+            ('12', 'Diagnose tunnel', 'connectivity & preflight checks'),
+            ('13', 'Diagnose all', 'multi-tunnel checks'),
+            ('14', 'Backup configs', 'save JSON backup'),
+            ('15', 'Restore configs', 'restore on clean manager'),
+            ('16', 'Delete tunnel', 'requires explicit YES'),
+        ])
+        ui_line()
+        print(f"  {ui_color('[ R ]', 'cyan')} Refresh     {ui_color('[ 0 ]', 'cyan')} Exit     {ui_color('[ Ctrl+C ]', 'muted')} Exit")
+        try:
+            choice=str(prompt('Select action', 'r')).strip().lower()
+            if choice in ('0','q','quit','exit'): return
+            if choice in ('r','refresh',''): continue
+            if choice in choices:
+                print()
+                ui_action(choice)
             else:
-                print("Unknown menu option")
-        except (Failure, ValueError, KeyboardInterrupt, EOFError) as exc:
-            print(f"[ERROR] {exc}", file=sys.stderr)
-
+                print(ui_color('  Unknown option. Enter a menu number.', 'yellow'))
+        except (Failure, ValueError, EOFError) as exc:
+            print(ui_color(f"  ERROR: {exc}", "red"), file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\n  Cancelled")
+        ui_pause()
 
 def make_parser():
     p = argparse.ArgumentParser(description="IPv4 GRE over IPv6 multi-peer tunnel manager (no NAT or default route changes)")
