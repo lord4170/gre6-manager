@@ -1,0 +1,1030 @@
+#!/usr/bin/env python3
+"""gre6ctl: IPv4-over-IPv6 GRE point-to-point tunnel manager.
+
+Standard library only. Linux + iproute2 + systemd. No NAT, forwarding, or
+changes to default routes. This is NOT an encrypted VPN.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import ipaddress as ipa
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+
+VERSION = "2.1.0"
+BASE = Path(os.environ.get("GRE6CTL_BASE", "/etc/gre6ctl"))
+TUNNELS = BASE / "tunnels"
+LOCK = BASE / ".lock"
+BIN = Path(os.environ.get("GRE6CTL_BIN", "/usr/local/sbin/gre6ctl"))
+UNIT = Path(os.environ.get("GRE6CTL_UNIT", "/etc/systemd/system/gre6ctl@.service"))
+# Five disjoint private /16 blocks, visited in the order requested by the user.
+# A /30 at offset zero is suggested in each block first; after the fifth,
+# allocation moves to offset four in each block (.5 / .6), and so on.
+AUTO_POOLS = tuple(ipa.IPv4Network(f"10.{octet}.0.0/16")
+                   for octet in (250, 200, 150, 100, 50))
+RFC1918 = tuple(map(ipa.IPv4Network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+NAME_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,14}$")
+TOKEN_PREFIX = "gre6ctl1:"
+REQUIRED = frozenset(("name", "local6", "peer6", "local4", "peer4", "subnet", "mtu", "hoplimit"))
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message):
+    raise Failure(str(message))
+
+
+def run(args, check=True, capture=True):
+    try:
+        p = subprocess.run(list(map(str, args)), text=True, capture_output=capture, check=False, timeout=35)
+    except subprocess.TimeoutExpired:
+        fail(f"Command timed out: {args[0]}")
+    except FileNotFoundError:
+        fail(f"Command not installed: {args[0]}")
+    if check and p.returncode:
+        msg = ((p.stderr or "") + " " + (p.stdout or "")).strip()
+        fail(f"{' '.join(map(str, args))} failed (exit {p.returncode}): {msg}")
+    return p
+
+
+def jrun(args):
+    p = run(args)
+    try:
+        return json.loads(p.stdout)
+    except (ValueError, TypeError):
+        fail(f"Unexpected JSON from: {' '.join(args)}")
+
+
+def root():
+    if os.geteuid() != 0:
+        fail("Run as root, e.g. sudo gre6ctl ...")
+
+
+def require_ip():
+    if not shutil.which("ip"):
+        fail("iproute2 is required (apt install iproute2)")
+
+
+def require_systemd():
+    if not shutil.which("systemctl"):
+        fail("systemd/systemctl is required")
+    if not UNIT.is_file() or not BIN.is_file():
+        fail("Run 'sudo python3 gre6ctl install' before enabling services")
+
+
+def valid_name(name):
+    if not isinstance(name, str) or not NAME_RX.fullmatch(name) or name.lower().startswith("ip6gre"):
+        fail("Invalid tunnel name: use letters, digits, _ or -, at most 15 characters; do not use ip6gre*")
+    return name
+
+
+def v6(value):
+    try:
+        addr = ipa.IPv6Address(value)
+    except (ValueError, ipa.AddressValueError):
+        fail(f"Invalid IPv6 address: {value}")
+    if addr.is_unspecified or addr.is_multicast or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.ipv4_mapped:
+        fail(f"IPv6 endpoint is not supported: {value} (use routable unicast addresses)")
+    return str(addr)
+
+
+def v4(value):
+    try:
+        addr = ipa.IPv4Address(value)
+    except ValueError:
+        fail(f"Invalid IPv4 address: {value}")
+    if not any(addr in net for net in RFC1918):
+        fail(f"Use RFC1918 IPv4 private addresses only: {value}")
+    return str(addr)
+
+
+def validated_config(data):
+    if not isinstance(data, dict) or not REQUIRED.issubset(data):
+        fail("Tunnel config is incomplete")
+    cfg = {k: data[k] for k in REQUIRED}
+    cfg["name"] = valid_name(cfg["name"])
+    cfg["local6"] = v6(cfg["local6"])
+    cfg["peer6"] = v6(cfg["peer6"])
+    if cfg["local6"] == cfg["peer6"]:
+        fail("IPv6 endpoints must differ")
+    cfg["local4"] = v4(cfg["local4"])
+    cfg["peer4"] = v4(cfg["peer4"])
+    try:
+        network = ipa.IPv4Network(cfg["subnet"], strict=True)
+    except (ValueError, TypeError):
+        fail("Subnet must be a canonical IPv4 /30, e.g. 10.250.1.0/30")
+    if network.prefixlen != 30 or not any(network.subnet_of(net) for net in RFC1918):
+        fail("Subnet must be an RFC1918 /30")
+    hosts = list(network.hosts())
+    if {ipa.IPv4Address(cfg["local4"]), ipa.IPv4Address(cfg["peer4"])} != set(hosts):
+        fail(f"Tunnel IPv4s must be the two usable hosts of {network} (not network or broadcast)")
+    cfg["subnet"] = str(network)
+    for key, low, high in (("mtu", 576, 1436), ("hoplimit", 1, 255)):
+        value = cfg[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            fail(f"{key} must be an integer in {low}..{high}")
+    return cfg
+
+
+def make_config(name, local6, peer6, subnet, local_ip=None, peer_ip=None, mtu=1400, hoplimit=64):
+    try:
+        network = ipa.IPv4Network(subnet, strict=True)
+    except ValueError:
+        fail("Specify a correctly aligned /30 subnet (e.g. 10.250.1.0/30)")
+    if network.prefixlen != 30:
+        fail("Only a /30 point-to-point subnet is supported")
+    hosts = list(network.hosts())
+    if (local_ip is None) != (peer_ip is None):
+        fail("Provide both --local-ip and --peer-ip, or neither")
+    return validated_config({
+        "name": name, "local6": local6, "peer6": peer6,
+        "local4": str(local_ip) if local_ip else str(hosts[0]) if hosts else "",
+        "peer4": str(peer_ip) if peer_ip else str(hosts[1]) if hosts else "",
+        "subnet": str(network), "mtu": mtu, "hoplimit": hoplimit,
+    })
+
+
+def filename(name):
+    return TUNNELS / (valid_name(name) + ".json")
+
+
+def prepare():
+    BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    TUNNELS.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(BASE, 0o700)
+    os.chmod(TUNNELS, 0o700)
+
+
+@contextmanager
+def locked():
+    prepare()
+    with open(LOCK, "a+", encoding="utf-8") as f:
+        os.chmod(LOCK, 0o600)
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".new-", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def save(cfg):
+    cfg = validated_config(cfg)
+    atomic_write(filename(cfg["name"]), json.dumps(cfg, indent=2, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def load(name):
+    path = filename(name)
+    if not path.is_file() or path.is_symlink():
+        fail(f"No saved tunnel named {name}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        fail(f"Invalid stored configuration: {path}")
+    cfg = validated_config(data)
+    if cfg["name"] != name:
+        fail("Config file name does not match interface name")
+    return cfg
+
+
+def all_configs():
+    if not TUNNELS.is_dir():
+        return []
+    configs = []
+    for p in sorted(TUNNELS.glob("*.json")):
+        if p.is_symlink():
+            fail(f"Refusing symbolic link: {p}")
+        configs.append(load(p.stem))
+    return configs
+
+
+def ipv4_kernel_networks(exclude_interface=None):
+    """Detect address networks and non-default routes, including unmanaged services."""
+    require_ip()
+    networks = []
+    addresses = jrun(["ip", "-j", "-4", "addr", "show"])
+    for interface in addresses:
+        if interface.get("ifname") == exclude_interface:
+            continue
+        for addr in interface.get("addr_info", []):
+            if addr.get("family") != "inet":
+                continue
+            try:
+                network = ipa.IPv4Interface(f"{addr['local']}/{addr['prefixlen']}").network
+                networks.append((network, f"interface {interface.get('ifname')}"))
+            except (ValueError, KeyError):
+                fail("Cannot interpret local IPv4 addresses, refusing unsafe allocation")
+    routes = jrun(["ip", "-j", "-4", "route", "show", "table", "all"])
+    for route in routes:
+        if route.get("dev") == exclude_interface:
+            continue
+        dest = route.get("dst", "default")
+        if dest == "default":
+            continue
+        try:
+            network = ipa.IPv4Network(dest, strict=False)
+        except ValueError:
+            fail("Cannot interpret IPv4 routing table; refusing unsafe allocation")
+        networks.append((network, f"route {dest} ({route.get('dev', 'unknown')})"))
+    return networks
+
+
+def assert_available(cfg, configs, kernel_networks, current_name=None):
+    target = ipa.IPv4Network(cfg["subnet"])
+    for other in configs:
+        if other["name"] == current_name:
+            continue
+        if target.overlaps(ipa.IPv4Network(other["subnet"])):
+            fail(f"IP collision: {target} overlaps tunnel {other['name']} ({other['subnet']})")
+        if (cfg["local6"], cfg["peer6"]) == (other["local6"], other["peer6"]):
+            fail(f"Duplicate GRE IPv6 endpoint pair with {other['name']} (keyless GRE cannot demultiplex this safely)")
+    for net, origin in kernel_networks:
+        if target.overlaps(net):
+            fail(f"IP collision: {target} overlaps {net} owned by {origin}")
+
+
+def next_subnet(configs, kernel_networks, current_name=None):
+    """First five: 10.250/30, 10.200/30, 10.150/30, 10.100/30, 10.50/30.
+
+    Subsequent rounds use the next /30 offset in each /16 pool. Existing
+    registrations and host addresses/routes (even outside our pools) win.
+    """
+    used = [ipa.IPv4Network(c["subnet"]) for c in configs if c["name"] != current_name]
+    used.extend(net for net, _ in kernel_networks)
+    # Each /16 has exactly 2**14 aligned /30 blocks.
+    for offset in range(0, AUTO_POOLS[0].num_addresses, 4):
+        for pool in AUTO_POOLS:
+            candidate = ipa.IPv4Network((int(pool.network_address) + offset, 30))
+            if not any(candidate.overlaps(net) for net in used):
+                return str(candidate)
+    fail("No free /30 in the automatic IP pools; select an unused RFC1918 subnet manually")
+
+
+def get_link(name):
+    p = run(["ip", "-d", "-j", "link", "show", "dev", name], check=False)
+    if p.returncode:
+        return None
+    try:
+        data = json.loads(p.stdout)
+        return data[0] if data else None
+    except (ValueError, IndexError):
+        fail("Cannot inspect existing interface safely")
+
+
+def owned_link(link, name):
+    return (link is not None and link.get("ifalias") == f"gre6ctl:{name}"
+            and link.get("linkinfo", {}).get("info_kind") == "ip6gre")
+
+
+def ensure_local_ipv6(addr):
+    addresses = jrun(["ip", "-j", "-6", "addr", "show"])
+    for link in addresses:
+        for a in link.get("addr_info", []):
+            if a.get("family") == "inet6" and a.get("local") == addr and not a.get("tentative", False) and "tentative" not in a.get("flags", []):
+                return
+    fail(f"Local IPv6 {addr} is not configured on this server (or is tentative)")
+
+
+def preflight(cfg):
+    require_ip()
+    ensure_local_ipv6(cfg["local6"])
+    run(["ip", "-6", "route", "get", cfg["peer6"], "from", cfg["local6"]])
+    if shutil.which("modprobe"):
+        run(["modprobe", "ip6_gre"], check=False)
+
+
+def apply(cfg):
+    """Recreate only interfaces that carry our ownership alias, never other links."""
+    cfg = validated_config(cfg)
+    name = cfg["name"]
+    preflight(cfg)  # do all basic checks before removing a running tunnel
+    link = get_link(name)
+    if link is not None and not owned_link(link, name):
+        fail(f"Refusing to touch {name}: an unmanaged interface already uses that name")
+    if link is not None:
+        run(["ip", "link", "del", "dev", name])
+    created = False
+    try:
+        run(["ip", "link", "add", "dev", name, "type", "ip6gre",
+             "local", cfg["local6"], "remote", cfg["peer6"], "hoplimit", cfg["hoplimit"]])
+        created = True
+        run(["ip", "link", "set", "dev", name, "alias", f"gre6ctl:{name}"])
+        run(["ip", "link", "set", "dev", name, "mtu", cfg["mtu"]])
+        run(["ip", "-4", "addr", "add", f"{cfg['local4']}/30", "dev", name])
+        run(["ip", "link", "set", "dev", name, "up"])
+    except Failure:
+        # This specific link was created by us; clean up even if alias setting failed.
+        if created:
+            run(["ip", "link", "del", "dev", name], check=False)
+        raise
+
+
+def down(name):
+    link = get_link(valid_name(name))
+    if link is None:
+        return
+    if not owned_link(link, name):
+        fail(f"Refusing to delete unmanaged link {name}")
+    run(["ip", "link", "del", "dev", name])
+
+
+def unit_name(name):
+    return f"gre6ctl@{valid_name(name)}.service"
+
+
+def systemctl(*args, check=True):
+    return run(["systemctl", *args], check=check)
+
+
+def enabled(name):
+    return systemctl("is-enabled", "--quiet", unit_name(name), check=False).returncode == 0
+
+
+def active(name):
+    return systemctl("is-active", "--quiet", unit_name(name), check=False).returncode == 0
+
+
+def install_cmd(_args):
+    root()
+    require_ip()
+    require_systemd_available = shutil.which("systemctl")
+    if not require_systemd_available:
+        fail("systemd is required")
+    source = Path(__file__).resolve()
+    if source != BIN:
+        BIN.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        shutil.copyfile(source, BIN)
+    os.chmod(BIN, 0o755)
+    prepare()
+    unit = """[Unit]
+Description=gre6ctl IPv4-over-IPv6 GRE tunnel %i
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+ExecStart=/usr/local/sbin/gre6ctl up %i
+ExecStop=/usr/local/sbin/gre6ctl down %i
+TimeoutStartSec=45
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+"""
+    if str(BIN) != "/usr/local/sbin/gre6ctl":
+        unit = unit.replace("/usr/local/sbin/gre6ctl", str(BIN))
+    UNIT.parent.mkdir(parents=True, exist_ok=True)
+    # Unit files are non-secret; must be readable by systemd.
+    tmp = UNIT.with_name(UNIT.name + ".tmp")
+    tmp.write_text(unit, encoding="utf-8")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, UNIT)
+    systemctl("daemon-reload")
+    print(f"Installed gre6ctl {VERSION} at {BIN}; configs in {TUNNELS}")
+    print("Start menu with: sudo gre6ctl menu")
+
+
+def validate_ips_option(a):
+    if (a.local_ip is None) != (a.peer_ip is None):
+        fail("Use --local-ip and --peer-ip together")
+
+
+def resolve_custom_ipv4():
+    """Interactive fallback when the suggested private IPv4 pair is declined."""
+    choice = prompt("Choose custom IP format: pair or subnet", "pair").strip().lower()
+    if choice == "subnet":
+        subnet = prompt("Custom private /30 subnet (e.g. 10.80.4.0/30)")
+        if not subnet:
+            fail("Subnet cannot be empty")
+        return subnet, None, None
+    if choice == "pair":
+        local = prompt("THIS / foreign server private IPv4 (e.g. 10.80.4.1)")
+        peer = prompt("PEER / Iran server private IPv4 (e.g. 10.80.4.2)")
+        if not local or not peer:
+            fail("Both private IPv4 addresses are required")
+        try:
+            subnet = str(ipa.IPv4Network(f"{local}/30", strict=False))
+        except ValueError:
+            fail(f"Invalid local IPv4 address: {local}")
+        return subnet, local, peer
+    fail("Choose 'pair' or 'subnet'")
+
+
+def create_cmd(args):
+    root()
+    validate_ips_option(args)
+    # A manually supplied --subnet or --local-ip/--peer-ip is already an
+    # explicit choice, so only automatically suggested pairs need approval.
+    automatic = args.subnet is None and args.local_ip is None
+    explicit_subnet = args.subnet
+    local_ip, peer_ip = args.local_ip, args.peer_ip
+    if automatic and not getattr(args, "accept_auto", False):
+        # Do not hold a shared IPAM lock while waiting for keyboard input.
+        # Revalidate the chosen subnet under the lock just before saving.
+        with locked():
+            configs = all_configs()
+            if any(c["name"] == args.name for c in configs):
+                fail(f"Tunnel {args.name} already exists")
+            if get_link(args.name) is not None:
+                fail(f"A network interface named {args.name} already exists")
+            suggestion = next_subnet(configs, ipv4_kernel_networks())
+            preview = make_config(args.name, args.local6, args.peer6, suggestion,
+                                  mtu=args.mtu, hoplimit=args.hoplimit)
+        print(f"\nSuggested private IPv4s for {args.name}:")
+        print(f"  THIS / foreign server: {preview['local4']}")
+        print(f"  PEER / Iran server:    {preview['peer4']}")
+        print(f"  Private subnet:        {preview['subnet']}")
+        decision = prompt("Use these IPs? (Y/n)", "y").lower()
+        if decision in ("y", "yes"):
+            explicit_subnet = suggestion
+        elif decision in ("n", "no"):
+            explicit_subnet, local_ip, peer_ip = resolve_custom_ipv4()
+        else:
+            fail("Answer y or n; no tunnel was created")
+    with locked():
+        configs = all_configs()
+        if any(c["name"] == args.name for c in configs):
+            fail(f"Tunnel {args.name} already exists")
+        if get_link(args.name) is not None:
+            fail(f"A network interface named {args.name} already exists")
+        kernel = ipv4_kernel_networks()
+        subnet = explicit_subnet or (str(ipa.IPv4Network(f"{local_ip}/30", strict=False))
+                                     if local_ip else next_subnet(configs, kernel))
+        cfg = make_config(args.name, args.local6, args.peer6, subnet,
+                          local_ip, peer_ip, args.mtu, args.hoplimit)
+        assert_available(cfg, configs, kernel)
+        save(cfg)
+    print(f"Created {cfg['name']}: {cfg['local4']} <-> {cfg['peer4']} ({cfg['subnet']})")
+    if args.enable:
+        enable_cmd(arg_name(args.name))
+    elif args.up:
+        up_cmd(arg_name(args.name))
+    print("On hub, run 'gre6ctl export-peer NAME' and import token on peer server.")
+
+
+def up_cmd(args):
+    root()
+    with locked():
+        cfg = load(args.name)
+        kernel = ipv4_kernel_networks(exclude_interface=cfg["name"])
+        assert_available(cfg, all_configs(), kernel, current_name=cfg["name"])
+        apply(cfg)
+    print(f"UP {cfg['name']}: {cfg['local4']} -> {cfg['peer4']} on {cfg['subnet']}")
+
+
+def down_cmd(args):
+    root()
+    down(args.name)
+    print(f"DOWN {args.name}")
+
+
+def enable_cmd(args):
+    root()
+    load(args.name)
+    require_systemd()
+    systemctl("enable", unit_name(args.name))
+    systemctl("restart", unit_name(args.name))
+    print(f"Enabled and started {args.name} at boot")
+
+
+def disable_cmd(args):
+    root()
+    require_systemd()
+    systemctl("disable", "--now", unit_name(args.name))
+    down(args.name)
+    print(f"Stopped and disabled {args.name} (configuration retained)")
+
+
+def restart_cmd(args):
+    root()
+    if active(args.name):
+        systemctl("restart", unit_name(args.name))
+    else:
+        up_cmd(args)
+    print(f"Restarted {args.name}")
+
+
+def list_cmd(_args):
+    rows = all_configs()
+    if not rows:
+        print("No tunnels configured")
+        return
+    print(f"{'NAME':<15} {'LOCAL / PEER IPv4':<35} {'SUBNET':<19} {'LINK':<8} {'BOOT':<8}")
+    for cfg in rows:
+        link = get_link(cfg["name"])
+        state = "UP" if owned_link(link, cfg["name"]) and "UP" in link.get("flags", []) else "DOWN"
+        print(f"{cfg['name']:<15} {(cfg['local4']+' / '+cfg['peer4']):<35} {cfg['subnet']:<19} {state:<8} {'yes' if enabled(cfg['name']) else 'no':<8}")
+
+
+def status_cmd(args):
+    cfg = load(args.name)
+    print(json.dumps(cfg, indent=2))
+    print("\n-- Runtime interface --")
+    require_ip()
+    link = get_link(args.name)
+    print("not present" if link is None else json.dumps(link, indent=2))
+    if link:
+        print(run(["ip", "-s", "-4", "addr", "show", "dev", args.name], check=False).stdout)
+    print(f"systemd enabled={enabled(args.name)} active={active(args.name)}")
+
+
+
+def ipam_cmd(_args):
+    """Read-only inventory of reserved blocks and next safe /30."""
+    with locked():
+        configs = all_configs()
+        kernel = ipv4_kernel_networks()
+        print("Automatic /30 pool order: " + ", ".join(map(str, AUTO_POOLS)))
+        print("Saved assignments:")
+        if not configs:
+            print("  (none)")
+        for cfg in configs:
+            print(f"  {cfg['name']:<15} {cfg['subnet']:<19} local={cfg['local4']} peer={cfg['peer4']}")
+        try:
+            # Ignore kernel routes of the managed tunnels; their networks are already in configs.
+            kernel_others = []
+            # ipv4_kernel_networks without exclusion contains duplicate owned routes, which is harmless.
+            kernel_others.extend(kernel)
+            subnet = next_subnet(configs, kernel_others)
+            hosts = list(ipa.IPv4Network(subnet).hosts())
+            print(f"Next suggested: foreign/local={hosts[0]} iran/peer={hosts[1]} ({subnet})")
+        except Failure as exc:
+            print("Automatic allocation unavailable:", exc)
+
+
+def check_subnet_cmd(args):
+    try:
+        net = ipa.IPv4Network(args.subnet, strict=True)
+    except ValueError:
+        fail("Provide an aligned IPv4 /30 network")
+    if net.prefixlen != 30 or not any(net.subnet_of(n) for n in RFC1918):
+        fail("Specify an RFC1918 /30 network")
+    with locked():
+        configs = all_configs()
+        current = next((c for c in configs if c['name'] == args.exclude), None)
+        if args.exclude and current is None:
+            fail(f"Tunnel does not exist: {args.exclude}")
+        for c in configs:
+            if c['name'] != args.exclude and net.overlaps(ipa.IPv4Network(c['subnet'])):
+                fail(f"COLLISION with saved tunnel {c['name']} ({c['subnet']})")
+        for existing, source in ipv4_kernel_networks(exclude_interface=args.exclude):
+            if net.overlaps(existing):
+                fail(f"COLLISION with {source}: {existing}")
+    print(f"AVAILABLE on this server: {net}; usable hosts {list(net.hosts())[0]} and {list(net.hosts())[1]}")
+    print("Reminder: a remote server cannot be checked from here; import and validate there too.")
+
+
+def doctor_all_cmd(_args):
+    configs = all_configs()
+    if not configs:
+        print("No tunnels configured")
+    errors = []
+    for cfg in configs:
+        print("\n" + "=" * 50)
+        try:
+            doctor_cmd(arg_name(cfg['name']))
+        except Failure as exc:
+            errors.append(cfg['name'])
+            print(f"[FAIL] {exc}")
+    if errors:
+        fail("Diagnose failure: " + ", ".join(errors))
+
+
+def export_peer_cmd(args):
+    cfg = load(args.name)
+    peer = dict(cfg)
+    peer["local6"], peer["peer6"] = cfg["peer6"], cfg["local6"]
+    peer["local4"], peer["peer4"] = cfg["peer4"], cfg["local4"]
+    payload = {"format": "gre6ctl-peer", "version": 1, "config": peer}
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    token = TOKEN_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    print(token)
+    print("\nThis token contains configuration, not credentials. Transfer through a trusted channel.", file=sys.stderr)
+
+
+def decode_peer(token):
+    token = token.strip()
+    if not token.startswith(TOKEN_PREFIX) or len(token) > 4096:
+        fail("Invalid peer token format/length")
+    value = token[len(TOKEN_PREFIX):]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        fail("Malformed token")
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        fail("Token is not valid base64 JSON")
+    if not isinstance(data, dict) or data.get("format") != "gre6ctl-peer" or data.get("version") != 1:
+        fail("Unsupported peer token version")
+    return validated_config(data.get("config"))
+
+
+def import_peer_cmd(args):
+    root()
+    cfg = decode_peer(args.token)
+    if args.name:
+        cfg["name"] = valid_name(args.name)
+    replace_config(cfg, overwrite=args.update, up=args.up, enable=args.enable)
+    print(f"Imported {cfg['name']}: {cfg['local4']} -> {cfg['peer4']}")
+
+
+def replace_config(cfg, overwrite=False, up=False, enable=False):
+    cfg = validated_config(cfg)
+    name = cfg["name"]
+    with locked():
+        allc = all_configs()
+        old = next((c for c in allc if c["name"] == name), None)
+        if old and not overwrite:
+            fail(f"Tunnel {name} exists; use --update to replace it")
+        link = get_link(name)
+        if old is None and link is not None:
+            fail(f"Interface {name} already exists")
+        kernel = ipv4_kernel_networks(exclude_interface=name if old else None)
+        assert_available(cfg, allc, kernel, current_name=name if old else None)
+        if old and link and owned_link(link, name):
+            try:
+                apply(cfg)
+            except Failure:
+                try:
+                    apply(old)
+                except Failure as exc:
+                    print(f"CRITICAL: rollback of {name} failed: {exc}", file=sys.stderr)
+                raise
+        elif link and not owned_link(link, name):
+            fail(f"Refusing to overwrite unmanaged interface {name}")
+        save(cfg)
+    if enable:
+        enable_cmd(arg_name(name))
+    elif up:
+        up_cmd(arg_name(name))
+
+
+def edit_cmd(args):
+    root()
+    if not any((args.subnet is not None, args.local_ip is not None,
+                args.peer_ip is not None, args.local6 is not None,
+                args.peer6 is not None, args.mtu is not None, args.hoplimit is not None)):
+        fail("Specify at least one change")
+    validate_ips_option(args)
+    with locked():
+        old = load(args.name)
+        allc = all_configs()
+        kernel = ipv4_kernel_networks(exclude_interface=args.name)
+        subnet = args.subnet if args.subnet is not None else old["subnet"]
+        if args.subnet is not None and args.local_ip is None:
+            local_ip, peer_ip = None, None   # select .1 and .2 of new subnet
+        else:
+            local_ip = args.local_ip if args.local_ip is not None else old["local4"]
+            peer_ip = args.peer_ip if args.peer_ip is not None else old["peer4"]
+        cfg = make_config(args.name, args.local6 or old["local6"], args.peer6 or old["peer6"],
+                          subnet, local_ip, peer_ip,
+                          args.mtu if args.mtu is not None else old["mtu"],
+                          args.hoplimit if args.hoplimit is not None else old["hoplimit"])
+        assert_available(cfg, allc, kernel, current_name=args.name)
+        link = get_link(args.name)
+        if link and not owned_link(link, args.name):
+            fail("Refusing to update an unmanaged interface")
+        if link:
+            try:
+                apply(cfg)
+            except Failure:
+                try:
+                    apply(old)
+                except Failure as exc:
+                    print(f"CRITICAL: rollback failed: {exc}", file=sys.stderr)
+                raise
+        save(cfg)
+    print(f"Updated {args.name}: {cfg['local4']} -> {cfg['peer4']} ({cfg['subnet']})")
+    print("IMPORTANT: regenerate 'export-peer NAME' and import with --update on the remote server.")
+
+
+def delete_cmd(args):
+    root()
+    load(args.name)
+    if not args.yes:
+        ans = input(f"Remove tunnel {args.name}? [type YES] ").strip()
+        if ans != "YES":
+            print("Cancelled")
+            return
+    if UNIT.is_file() and shutil.which("systemctl"):
+        systemctl("disable", "--now", unit_name(args.name), check=False)
+    down(args.name)
+    with locked():
+        filename(args.name).unlink()
+    print(f"Deleted {args.name} (no default routes, firewall or NAT modified)")
+
+
+def ping(args):
+    return run(args, check=False, capture=True)
+
+
+def doctor_cmd(args):
+    cfg = load(args.name)
+    name = cfg["name"]
+    print(f"GRE6 doctor for {name} ({cfg['subnet']})")
+    checks = []
+    def check(label, callback):
+        try:
+            callback()
+            print(f"[OK]   {label}")
+            checks.append(True)
+        except Failure as exc:
+            print(f"[FAIL] {label}: {exc}")
+            checks.append(False)
+    check("iproute2", require_ip)
+    check("Local IPv6 assigned", lambda: ensure_local_ipv6(cfg["local6"]))
+    check("IPv6 route to peer", lambda: run(["ip", "-6", "route", "get", cfg["peer6"], "from", cfg["local6"]]))
+    link = get_link(name)
+    check("GRE interface owned by gre6ctl", lambda: None if owned_link(link, name) else fail("interface missing or not managed"))
+    if owned_link(link, name):
+        check("Interface administratively UP", lambda: None if "UP" in link.get("flags", []) else fail("interface is DOWN"))
+        print(run(["ip", "-s", "link", "show", "dev", name], check=False).stdout.rstrip())
+    p6 = ping(["ping", "-6", "-c", "2", "-W", "2", cfg["peer6"]]) if shutil.which("ping") else None
+    print(f"[{'OK' if p6 and p6.returncode == 0 else 'WARN'}] Public IPv6 ping to peer (ICMPv6 may be filtered)")
+    p4 = ping(["ping", "-4", "-I", name, "-c", "2", "-W", "2", cfg["peer4"]]) if shutil.which("ping") and owned_link(link, name) else None
+    print(f"[{'OK' if p4 and p4.returncode == 0 else 'WARN'}] Private IPv4 ping to peer")
+    if p4 is not None:
+        print((p4.stdout or p4.stderr or "").strip()[-700:])
+    try:
+        kernel = ipv4_kernel_networks(exclude_interface=name)
+        assert_available(cfg, all_configs(), kernel, current_name=name)
+        print("[OK]   No detected local IPv4 subnet overlap")
+    except Failure as exc:
+        print(f"[FAIL] IPv4 conflict: {exc}")
+        checks.append(False)
+    print("\nTroubleshooting: allow IPv6 next-header 47/GRE in host AND provider firewalls;")
+    print("check peer config, matching IPv6 endpoints and IP pair, MTU, and ip6_gre module.")
+    print("GRE is NOT TCP/UDP port 47. This tool never changes default route, NAT or forwarding.")
+    if not all(checks):
+        fail("Preflight failed; review diagnostics above")
+
+
+def backup_cmd(args):
+    root()
+    target = Path(args.path).expanduser().resolve()
+    if target.exists() and not args.overwrite:
+        fail(f"Backup already exists: {target} (use --overwrite)")
+    with locked():
+        configs = all_configs()
+        payload = {"format": "gre6ctl-backup", "version": 1,
+                   "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(), "configs": configs}
+        atomic_write(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(f"Saved {len(configs)} tunnel configs to {target} (mode 0600)")
+
+
+def restore_cmd(args):
+    root()
+    path = Path(args.path).expanduser().resolve()
+    if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+        fail("Missing or oversized backup")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        fail("Unreadable backup")
+    if data.get("format") != "gre6ctl-backup" or data.get("version") != 1 or not isinstance(data.get("configs"), list):
+        fail("Unsupported backup format")
+    candidates = [validated_config(d) for d in data["configs"]]
+    if len(set(c["name"] for c in candidates)) != len(candidates):
+        fail("Backup has duplicate tunnel names")
+    with locked():
+        installed = all_configs()
+        kernel = ipv4_kernel_networks()
+        new_names = {c["name"] for c in candidates}
+        for cfg in candidates:
+            if any(old["name"] == cfg["name"] for old in installed):
+                fail(f"Tunnel {cfg['name']} already exists; restore only to a clean manager")
+            if get_link(cfg["name"]):
+                fail(f"Interface {cfg['name']} already exists")
+            assert_available(cfg, installed + [c for c in candidates if c["name"] != cfg["name"]], kernel)
+        for cfg in candidates:
+            save(cfg)
+    print(f"Restored {len(candidates)} configs (not started). Enable individually after checking peer settings.")
+
+
+def arg_name(name):
+    return argparse.Namespace(name=name)
+
+
+def prompt(label, default=None):
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        value = input(f"{label}{suffix}: ").strip()
+    except EOFError:
+        fail("Interactive IP approval requires input; use --accept-auto for unattended creation")
+    return value if value else default
+
+
+def menu_cmd(_args):
+    root()
+    while True:
+        print("\n╔══════════════════════════════════════════════════╗")
+        print("║ gre6ctl 2.1 — GRE6 multi-peer tunnel manager     ║")
+        print("╚══════════════════════════════════════════════════╝")
+        print("1. List tunnels        2. Create tunnel")
+        print("3. Export peer token   4. Import/update peer")
+        print("5. Edit private IPv4   6. Change MTU / endpoints")
+        print("7. Start/restart       8. Stop / disable")
+        print("9. Diagnose            10. Show details")
+        print("11. Delete             12. Backup configs")
+        print("13. IPAM overview      14. Check subnet")
+        print("15. Restore backup     16. Diagnose all")
+        print("0. Exit")
+        try:
+            choice = input("Select: ").strip()
+            if choice == "0":
+                return
+            if choice == "1":
+                list_cmd(None)
+            elif choice == "2":
+                name = prompt("Tunnel name (e.g. iran1)")
+                local6 = prompt("THIS server public IPv6")
+                peer6 = prompt("PEER server public IPv6")
+                mtu = int(prompt("MTU", "1400"))
+                # create_cmd shows suggested IPs and asks to approve or enter
+                # a custom pair/subnet; this prompt is shared with the CLI.
+                create_cmd(argparse.Namespace(name=name, local6=local6, peer6=peer6,
+                           subnet=None, local_ip=None, peer_ip=None, mtu=mtu,
+                           hoplimit=64, enable=False, up=False, accept_auto=False))
+                if prompt("Activate and enable after reboot? (y/N)", "n").lower() == "y":
+                    enable_cmd(arg_name(name))
+            elif choice == "3":
+                export_peer_cmd(arg_name(prompt("Tunnel name")))
+            elif choice == "4":
+                token = prompt("Paste peer token")
+                cfg = decode_peer(token)
+                name = prompt("Local interface name", cfg["name"])
+                update = prompt("Update existing tunnel? (y/N)", "n").lower() == "y"
+                up = prompt("Enable and start automatically? (y/N)", "n").lower() == "y"
+                import_peer_cmd(argparse.Namespace(token=token, name=name, update=update, up=False, enable=up))
+            elif choice == "5":
+                name = prompt("Tunnel name")
+                old = load(name)
+                print(f"Current: {old['local4']} <-> {old['peer4']} ({old['subnet']})")
+                mode = prompt("Change (subnet / pair)", "subnet")
+                sub = local = peer = None
+                if mode == "subnet":
+                    sub = prompt("New /30 subnet")
+                elif mode == "pair":
+                    local = prompt("New local private IPv4")
+                    peer = prompt("New peer private IPv4")
+                    sub = str(ipa.IPv4Network(f"{local}/30", strict=False))
+                else:
+                    fail("Choose subnet or pair")
+                edit_cmd(argparse.Namespace(name=name, subnet=sub, local_ip=local, peer_ip=peer,
+                         local6=None, peer6=None, mtu=None, hoplimit=None))
+            elif choice == "6":
+                name = prompt("Tunnel name")
+                cfg = load(name)
+                edit_cmd(argparse.Namespace(name=name, subnet=None, local_ip=None, peer_ip=None,
+                    local6=prompt("This server IPv6", cfg["local6"]),
+                    peer6=prompt("Peer server IPv6", cfg["peer6"]),
+                    mtu=int(prompt("MTU", str(cfg["mtu"]))),
+                    hoplimit=int(prompt("Hop limit", str(cfg["hoplimit"])))))
+            elif choice == "7":
+                name = prompt("Tunnel name")
+                if prompt("Enable on reboot? (Y/n)", "y").lower() == "y":
+                    enable_cmd(arg_name(name))
+                else:
+                    restart_cmd(arg_name(name))
+            elif choice == "8":
+                disable_cmd(arg_name(prompt("Tunnel name")))
+            elif choice == "9":
+                doctor_cmd(arg_name(prompt("Tunnel name")))
+            elif choice == "10":
+                status_cmd(arg_name(prompt("Tunnel name")))
+            elif choice == "11":
+                delete_cmd(argparse.Namespace(name=prompt("Tunnel name"), yes=False))
+            elif choice == "12":
+                backup_cmd(argparse.Namespace(path=prompt("Backup file", "/root/gre6ctl-backup.json"), overwrite=False))
+            elif choice == "13":
+                ipam_cmd(None)
+            elif choice == "14":
+                check_subnet_cmd(argparse.Namespace(subnet=prompt("Private IPv4 /30 subnet"), exclude=None))
+            elif choice == "15":
+                restore_cmd(argparse.Namespace(path=prompt("Backup file", "/root/gre6ctl-backup.json")))
+            elif choice == "16":
+                doctor_all_cmd(None)
+            else:
+                print("Unknown menu option")
+        except (Failure, ValueError, KeyboardInterrupt, EOFError) as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+
+
+def make_parser():
+    p = argparse.ArgumentParser(description="IPv4 GRE over IPv6 multi-peer tunnel manager (no NAT or default route changes)")
+    p.add_argument("--version", action="version", version=f"gre6ctl {VERSION}")
+    sp = p.add_subparsers(dest="command")
+    def cmd(name, func, help):
+        a = sp.add_parser(name, help=help)
+        a.set_defaults(func=func)
+        return a
+    cmd("install", install_cmd, "Install binary and systemd unit")
+    cmd("menu", menu_cmd, "Interactive management menu")
+    create = cmd("create", create_cmd, "Create tunnel and allocate collision-free /30")
+    create.add_argument("name")
+    create.add_argument("--local6", required=True)
+    create.add_argument("--peer6", required=True)
+    create.add_argument("--subnet", help="Explicit /30 network, defaults to automatic pool selection")
+    create.add_argument("--local-ip", help="Choose local IPv4; must specify peer-ip too")
+    create.add_argument("--peer-ip", help="Choose peer IPv4; must specify local-ip too")
+    create.add_argument("--accept-auto", action="store_true",
+                        help="Use next safe automatic pair without prompting (for scripts/noninteractive use)")
+    create.add_argument("--mtu", type=int, default=1400)
+    create.add_argument("--hoplimit", type=int, default=64)
+    cx = create.add_mutually_exclusive_group()
+    cx.add_argument("--up", action="store_true", help="Activate now")
+    cx.add_argument("--enable", action="store_true", help="Activate now and on boot")
+    for name, func, help in (("up", up_cmd, "Apply/start tunnel"), ("down", down_cmd, "Stop tunnel"),
+                             ("enable", enable_cmd, "Start tunnel and enable at boot"),
+                             ("disable", disable_cmd, "Stop and disable at boot"),
+                             ("restart", restart_cmd, "Recreate tunnel"),
+                             ("status", status_cmd, "Show tunnel details and runtime status"),
+                             ("doctor", doctor_cmd, "Diagnose connectivity/ownership/conflicts"),
+                             ("export-peer", export_peer_cmd, "Export reversed configuration for peer")):
+        a = cmd(name, func, help)
+        a.add_argument("name")
+    cmd("list", list_cmd, "List configured tunnels")
+    cmd("ipam", ipam_cmd, "Show all reserved /30 networks and next available allocation")
+    check_subnet = cmd("check-subnet", check_subnet_cmd, "Verify a custom /30 does not conflict locally")
+    check_subnet.add_argument("subnet")
+    check_subnet.add_argument("--exclude", help="Exclude this managed interface while editing")
+    cmd("doctor-all", doctor_all_cmd, "Diagnose every configured tunnel")
+    imp = cmd("import-peer", import_peer_cmd, "Import peer token (or --update existing config)")
+    imp.add_argument("token", help="gre6ctl1:... peer token")
+    imp.add_argument("--name", help="Override interface name for this server")
+    imp.add_argument("--update", action="store_true")
+    ix = imp.add_mutually_exclusive_group()
+    ix.add_argument("--up", action="store_true")
+    ix.add_argument("--enable", action="store_true")
+    edit = cmd("edit", edit_cmd, "Change IPv4/IPv6/MTU with collision validation and rollback")
+    edit.add_argument("name")
+    edit.add_argument("--subnet", help="New /30 subnet (automatically selects host pair)")
+    edit.add_argument("--local-ip")
+    edit.add_argument("--peer-ip")
+    edit.add_argument("--local6")
+    edit.add_argument("--peer6")
+    edit.add_argument("--mtu", type=int)
+    edit.add_argument("--hoplimit", type=int)
+    rm = cmd("delete", delete_cmd, "Remove a tunnel (keep other tunnels)")
+    rm.add_argument("name")
+    rm.add_argument("--yes", action="store_true")
+    bk = cmd("backup", backup_cmd, "Export all configs to a backup JSON file")
+    bk.add_argument("path")
+    bk.add_argument("--overwrite", action="store_true")
+    rs = cmd("restore", restore_cmd, "Restore backup onto clean manager (not automatically started)")
+    rs.add_argument("path")
+    return p
+
+
+def main():
+    args = make_parser().parse_args()
+    if args.command is None:
+        args = argparse.Namespace(command="menu", func=menu_cmd)
+    try:
+        args.func(args)
+    except Failure as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    except (OSError, KeyboardInterrupt) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
